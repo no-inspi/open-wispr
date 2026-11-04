@@ -10,9 +10,98 @@ enum JarvisError: LocalizedError {
     }
 }
 
-/// Envoie une demande à Hermes Agent (API compatible OpenAI, endpoint /v1/responses en streaming).
+/// Appels à l'API Runs d'Hermes. Un run tourne sur le VPS indépendamment de la connexion :
+/// si le flux d'événements tombe, on interroge le run au lieu d'abandonner.
+struct JarvisAPI {
+    let base: String
+    let key: String
+
+    private func request(_ path: String, method: String = "GET", body: [String: Any]? = nil,
+                         timeout: TimeInterval = 30) throws -> URLRequest {
+        guard let url = URL(string: base + path) else {
+            throw JarvisError.message("URL Jarvis invalide : \(base)")
+        }
+        var request = URLRequest(url: url, timeoutInterval: timeout)
+        request.httpMethod = method
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let body = body {
+            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        }
+        return request
+    }
+
+    func createRun(_ body: [String: Any]) async throws -> String {
+        let (data, response) = try await URLSession.shared.data(for: request("/v1/runs", method: "POST", body: body))
+        let code = (response as? HTTPURLResponse)?.statusCode ?? 0
+        guard (200..<300).contains(code) else {
+            throw JarvisError.message("HTTP \(code) \(String(decoding: data.prefix(200), as: UTF8.self))")
+        }
+        guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any],
+              let runID = json["run_id"] as? String else {
+            throw JarvisError.message("Réponse illisible de Jarvis.")
+        }
+        return runID
+    }
+
+    func stop(_ runID: String) async {
+        guard let request = try? request("/v1/runs/\(runID)/stop", method: "POST", body: [:]) else { return }
+        _ = try? await URLSession.shared.data(for: request)
+    }
+
+    func messages(_ sessionID: String) async throws -> [JarvisSessionMessage] {
+        let (data, _) = try await URLSession.shared.data(
+            for: request("/api/sessions/\(sessionID)/messages?order=latest&limit=50"))
+        return JarvisStream.parseMessages(data)
+    }
+
+    /// Attend la fin du run et retourne son résultat, jamais `.tool`.
+    func finish(_ runID: String, onTool: (String) async -> Void) async -> JarvisRunEvent {
+        // Le serveur envoie un keepalive toutes les 10 s : 60 s de silence = connexion perdue.
+        if let events = try? request("/v1/runs/\(runID)/events", timeout: 60),
+           let (bytes, _) = try? await URLSession.shared.bytes(for: events) {
+            do {
+                for try await line in bytes.lines {
+                    switch JarvisStream.parse(line) {
+                    case .tool(let name): await onTool(name)
+                    case .some(let result): return result
+                    case nil: continue
+                    }
+                }
+            } catch {
+                // On passe à l'interrogation du run ci-dessous.
+            }
+        }
+        return await poll(runID)
+    }
+
+    /// Compte les échecs plutôt que le temps : une veille du Mac ne doit pas passer pour une panne.
+    private func poll(_ runID: String) async -> JarvisRunEvent {
+        var failures = 0
+        while !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 3_000_000_000)
+            do {
+                let (data, response) = try await URLSession.shared.data(for: request("/v1/runs/\(runID)"))
+                if (response as? HTTPURLResponse)?.statusCode == 404 {
+                    return .failed("Résultat de Jarvis expiré.")
+                }
+                failures = 0
+                if let result = JarvisStream.parseRun(data) { return result }
+            } catch {
+                failures += 1
+                if failures >= 20 {
+                    return .failed("Connexion à Jarvis perdue. La tâche continue peut-être sur le VPS.")
+                }
+            }
+        }
+        return .cancelled
+    }
+}
+
+/// Envoie les demandes à Hermes Agent et suit les tâches de fond.
 /// Réglages : ~/.config/open-wispr/jarvis.json  ->  {"url": "http://<hôte-tailscale>:8642", "resetAfterMinutes": 10}
 /// Clé API : trousseau macOS, service "open-wispr-jarvis".
+/// Sauf mention contraire, tout s'appelle sur le thread principal.
 final class JarvisClient {
     struct Settings: Codable {
         var url: String?
@@ -21,14 +110,31 @@ final class JarvisClient {
     }
 
     static let keychainService = "open-wispr-jarvis"
+    private static let watchInterval: UInt64 = 20_000_000_000
+    private static let announcementPrompt = """
+        Une tâche de fond vient de se terminer. Annonce son résultat en 1 ou 2 phrases, \
+        sans utiliser d'outil.
+        """
 
-    private var previousResponseID: String?
-    private var currentTask: Task<Void, Never>?
+    /// Appelé quand une tâche de fond est terminée et que Jarvis l'a résumée.
+    var onAnnouncement: ((Result<String, Error>) -> Void)?
+    /// Faux tant que l'annonce gênerait : dictée en cours, Jarvis en train de parler.
+    var canAnnounce: () -> Bool = { true }
+
+    private var tracker = JarvisClient.loadTracker()
     private var lastExchange = Date.distantPast
+    private var currentTask: Task<Void, Never>?
+    private var currentRun: (api: JarvisAPI, id: String)?
+    private var watcher: Task<Void, Never>?
+    private var isAnnouncing = false
+    private var needsAnnouncement = false
+
+    private static var configDirectory: URL {
+        FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/open-wispr")
+    }
 
     private func loadSettings() -> Settings {
-        let path = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/open-wispr/jarvis.json")
+        let path = Self.configDirectory.appendingPathComponent("jarvis.json")
         guard let data = try? Data(contentsOf: path),
               let settings = try? JSONDecoder().decode(Settings.self, from: data) else {
             return Settings()
@@ -36,109 +142,190 @@ final class JarvisClient {
         return settings
     }
 
-    /// Interrompt la demande en cours : la déconnexion arrête aussi l'agent sur le serveur.
-    /// À appeler sur le thread principal. `completion` n'est alors plus appelé.
-    func cancel() {
-        currentTask?.cancel()
-        currentTask = nil
+    private static func loadTracker() -> JarvisBackgroundTracker {
+        let path = configDirectory.appendingPathComponent("jarvis-state.json")
+        guard let data = try? Data(contentsOf: path),
+              let tracker = try? JSONDecoder().decode(JarvisBackgroundTracker.self, from: data) else {
+            return JarvisBackgroundTracker()
+        }
+        return tracker
     }
 
-    /// À appeler sur le thread principal. Les deux closures sont appelées sur le thread principal.
+    private func saveTracker() {
+        guard let data = try? JSONEncoder().encode(tracker) else { return }
+        try? data.write(to: Self.configDirectory.appendingPathComponent("jarvis-state.json"), options: .atomic)
+    }
+
+    private func makeAPI(_ settings: Settings) throws -> JarvisAPI {
+        guard let key = Self.apiKey() else {
+            throw JarvisError.message("Clé API introuvable dans le trousseau (service \(Self.keychainService)).")
+        }
+        guard let url = settings.url, !url.isEmpty else {
+            throw JarvisError.message("URL Jarvis absente de ~/.config/open-wispr/jarvis.json.")
+        }
+        return JarvisAPI(base: url.trimmingCharacters(in: CharacterSet(charactersIn: "/")), key: key)
+    }
+
+    /// Reprend le suivi des tâches lancées avant un redémarrage de l'app.
+    func resume() {
+        startWatching()
+    }
+
+    /// Arrête la demande en cours. Les sous-agents déjà lancés continuent sur le VPS.
+    /// `completion` n'est alors plus appelé.
+    func cancel() {
+        if let run = currentRun {
+            Task { await run.api.stop(run.id) }
+        }
+        currentRun = nil
+        currentTask?.cancel()
+        currentTask = nil
+        if isAnnouncing {
+            isAnnouncing = false
+            needsAnnouncement = true
+        }
+    }
+
+    /// Les deux closures sont appelées sur le thread principal.
     func ask(_ text: String,
              onTool: @escaping (String) -> Void,
              completion: @escaping (Result<String, Error>) -> Void) {
         cancel()
+        startTurn(text, keepSession: false, onTool: onTool, completion: completion)
+    }
+
+    private func startTurn(_ text: String, keepSession: Bool,
+                           onTool: @escaping (String) -> Void,
+                           completion: @escaping (Result<String, Error>) -> Void) {
         let settings = loadSettings()
-        guard let key = Self.apiKey() else {
-            completion(.failure(JarvisError.message("Clé API introuvable dans le trousseau (service \(Self.keychainService)).")))
-            return
-        }
-        guard let configuredURL = settings.url, !configuredURL.isEmpty else {
-            completion(.failure(JarvisError.message("URL Jarvis absente de ~/.config/open-wispr/jarvis.json.")))
-            return
-        }
-        let base = configuredURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
-        guard let url = URL(string: base + "/v1/responses") else {
-            completion(.failure(JarvisError.message("URL Jarvis invalide : \(base)")))
+        let api: JarvisAPI
+        do {
+            api = try makeAPI(settings)
+        } catch {
+            completion(.failure(error))
             return
         }
 
-        // Nouvelle conversation après un moment d'inactivité.
-        if Date().timeIntervalSince(lastExchange) > (settings.resetAfterMinutes ?? 10) * 60 {
-            previousResponseID = nil
+        // Nouvelle conversation après un moment d'inactivité, sauf si une tâche de fond
+        // doit encore revenir dans celle-ci.
+        let inactive = Date().timeIntervalSince(lastExchange) > (settings.resetAfterMinutes ?? 10) * 60
+        if tracker.sessionID == nil || (inactive && !keepSession && !tracker.hasPending) {
+            tracker = JarvisBackgroundTracker()
+            tracker.sessionID = "jarvis-\(UUID().uuidString.lowercased())"
+            saveTracker()
         }
+        guard let sessionID = tracker.sessionID else { return }
 
-        var body: [String: Any] = [
-            "model": "hermes-agent",
+        let body: [String: Any] = [
             "input": text,
-            "stream": true,
+            "session_id": sessionID,
             "instructions": settings.instructions ?? """
                 Tu es Jarvis, l'assistant vocal de Charlie. Ta réponse sera lue à voix haute : \
                 réponds en français, en 2 à 4 phrases, sans markdown, sans listes ni code. \
-                Pour une tâche longue, lance-la en arrière-plan et dis simplement que c'est en cours.
+                Pour une tâche longue, délègue-la à un sous-agent, dis simplement que c'est en cours \
+                et termine ton tour : tu seras prévenu quand elle sera finie.
                 """,
         ]
-        if let previous = previousResponseID {
-            body["previous_response_id"] = previous
-        }
-
-        // Le serveur envoie un keepalive toutes les 10 s : 60 s de silence = connexion perdue,
-        // même si la tâche elle-même dure bien plus longtemps.
-        var request = URLRequest(url: url, timeoutInterval: 60)
-        request.httpMethod = "POST"
-        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
         currentTask = Task { [weak self] in
-            let result = await Self.stream(request) { name in
+            let runID: String
+            do {
+                runID = try await api.createRun(body)
+            } catch {
+                await MainActor.run { [weak self] in
+                    if !Task.isCancelled { self?.endTurn(.failed(error.localizedDescription), [], completion) }
+                }
+                return
+            }
+            let started: Bool = await MainActor.run { [weak self] in
+                guard !Task.isCancelled else { return false }
+                self?.currentRun = (api, runID)
+                return true
+            }
+            guard started else {
+                await api.stop(runID)
+                return
+            }
+
+            let result = await api.finish(runID) { name in
                 await MainActor.run {
                     if !Task.isCancelled { onTool(name) }
                 }
             }
+            let messages = (try? await api.messages(sessionID)) ?? []
             await MainActor.run { [weak self] in
-                guard !Task.isCancelled else { return }
-                self?.currentTask = nil
-                switch result {
-                case .success(let answer):
-                    self?.previousResponseID = answer.id
-                    self?.lastExchange = Date()
-                    completion(.success(answer.text))
-                case .failure(let error):
-                    completion(.failure(error))
-                }
+                if !Task.isCancelled { self?.endTurn(result, messages, completion) }
             }
         }
     }
 
-    private static func stream(_ request: URLRequest,
-                               onTool: (String) async -> Void) async -> Result<(id: String?, text: String), Error> {
-        do {
-            let (bytes, response) = try await URLSession.shared.bytes(for: request)
-            guard let http = response as? HTTPURLResponse else {
-                return .failure(JarvisError.message("Réponse vide de Jarvis."))
-            }
-            guard (200..<300).contains(http.statusCode) else {
-                var detail = Data()
-                for try await byte in bytes.prefix(200) { detail.append(byte) }
-                return .failure(JarvisError.message("HTTP \(http.statusCode) \(String(decoding: detail, as: UTF8.self))"))
-            }
-            for try await line in bytes.lines {
-                switch JarvisStream.parse(line) {
-                case .tool(let name):
-                    await onTool(name)
-                case .completed(let id, let text):
-                    return .success((id, text))
-                case .failed(let message):
-                    return .failure(JarvisError.message(message))
-                case nil:
-                    continue
-                }
-            }
-            return .failure(JarvisError.message("Connexion à Jarvis interrompue."))
-        } catch {
-            return .failure(error)
+    private func endTurn(_ result: JarvisRunEvent, _ messages: [JarvisSessionMessage],
+                         _ completion: (Result<String, Error>) -> Void) {
+        currentTask = nil
+        currentRun = nil
+        isAnnouncing = false
+        lastExchange = Date()
+        ingest(messages)
+
+        switch result {
+        case .completed(let answer):
+            completion(.success(answer))
+        case .failed(let message):
+            completion(.failure(JarvisError.message(message)))
+        case .cancelled, .tool:
+            completion(.failure(JarvisError.message("Demande annulée.")))
         }
+        startWatching()
+    }
+
+    private func ingest(_ messages: [JarvisSessionMessage]) {
+        if tracker.ingest(messages, now: Date()) > 0 {
+            needsAnnouncement = true
+        }
+        saveTracker()
+    }
+
+    private func startWatching() {
+        guard watcher == nil, tracker.hasPending || needsAnnouncement else { return }
+        watcher = Task { [weak self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: Self.watchInterval)
+                let next: (api: JarvisAPI, sessionID: String)? = await MainActor.run { [weak self] in
+                    guard let self = self else { return nil }
+                    let settings = self.loadSettings()
+                    guard let sessionID = self.tracker.sessionID,
+                          let api = try? self.makeAPI(settings) else { return nil }
+                    return (api, sessionID)
+                }
+                let messages = next == nil ? nil : try? await next?.api.messages(next?.sessionID ?? "")
+                let done: Bool = await MainActor.run { [weak self] in
+                    guard let self = self else { return true }
+                    return self.watchTick(messages)
+                }
+                if done { return }
+            }
+        }
+    }
+
+    /// Retourne vrai quand il n'y a plus rien à suivre.
+    private func watchTick(_ messages: [JarvisSessionMessage]?) -> Bool {
+        if let messages = messages, currentTask == nil {
+            ingest(messages)
+        }
+        if tracker.expire(now: Date()) > 0 {
+            saveTracker()
+            onAnnouncement?(.failure(JarvisError.message("Tâche de fond sans nouvelles depuis 24 h.")))
+        }
+        if needsAnnouncement, currentTask == nil, canAnnounce() {
+            needsAnnouncement = false
+            isAnnouncing = true
+            startTurn(Self.announcementPrompt, keepSession: true, onTool: { _ in }) { [weak self] result in
+                self?.onAnnouncement?(result)
+            }
+        }
+        guard !tracker.hasPending, !needsAnnouncement else { return false }
+        watcher = nil
+        return true
     }
 
     static func apiKey() -> String? {
@@ -169,6 +356,8 @@ final class JarvisSpeaker {
         synthesizer.speak(utterance)
     }
 
+    var isSpeaking: Bool { synthesizer.isSpeaking }
+
     func stop() {
         if synthesizer.isSpeaking {
             synthesizer.stopSpeaking(at: .immediate)
@@ -183,5 +372,17 @@ final class JarvisSpeaker {
         s = s.replacingOccurrences(of: "https?://\\S+", with: "un lien", options: .regularExpression)
         s = s.replacingOccurrences(of: "[*_`#>]", with: "", options: .regularExpression)
         return s
+    }
+}
+
+/// Notification macOS. Le binaire n'est pas un bundle d'app : on passe par osascript,
+/// le texte étant transmis en argument pour éviter tout échappement.
+enum JarvisNotifier {
+    static func notify(_ text: String) {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", "on run argv", "-e", "display notification (item 1 of argv) with title \"Jarvis\"",
+                             "-e", "end run", text]
+        try? process.run()
     }
 }

@@ -28,6 +28,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 self.render(self.jarvisPresenter.screenFreed())
             }
         }
+        setupJarvisAnnouncements()
         recorder = AudioRecorder()
         registerSleepWakeObservers()
 
@@ -450,6 +451,26 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 }
             }
         }
+    }
+
+    private func setupJarvisAnnouncements() {
+        jarvis.canAnnounce = { [weak self] in
+            guard let self = self else { return false }
+            if case .idle = self.statusBar.state { return !self.jarvisSpeaker.isSpeaking }
+            return false
+        }
+        jarvis.onAnnouncement = { [weak self] result in
+            switch result {
+            case .success(let answer):
+                print("Jarvis tâche de fond -> \(answer)")
+                JarvisNotifier.notify(JarvisSpeaker.plainText(answer))
+                self?.showJarvis(.answer(answer))
+            case .failure(let error):
+                print("Jarvis tâche de fond : \(error.localizedDescription)")
+                JarvisNotifier.notify(error.localizedDescription)
+            }
+        }
+        jarvis.resume()
     }
 
     private func askJarvis(_ text: String) {
