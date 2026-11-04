@@ -9,6 +9,9 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     var config: Config!
     var recordingLifecycle = RecordingLifecycle()
     private let recordingSoundFeedback = RecordingSoundFeedback()
+    private let jarvis = JarvisClient()
+    private let jarvisSpeaker = JarvisSpeaker()
+    private var jarvisMode = false
     var currentRecordingURL: URL?
     private var sleepWakeObservers: [NSObjectProtocol] = []
     private var accessibilityPollTimer: Timer?
@@ -338,6 +341,10 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func handleRecordingStart() {
+        // Option (⌥) maintenue au moment d'appuyer sur la touche = mode Jarvis.
+        jarvisMode = NSEvent.modifierFlags.contains(.option)
+        statusBar.jarvisMode = jarvisMode
+        jarvisSpeaker.stop()
         statusBar.state = .recording
         do {
             recorder.preferredDeviceID = AudioDeviceManager.resolveConfiguredDeviceID(
@@ -371,6 +378,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         currentRecordingURL = nil
+        let isJarvis = jarvisMode
         statusBar.state = .transcribing
         if config.isSoundFeedbackEnabled {
             recordingSoundFeedback.playStopped()
@@ -393,6 +401,10 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                 DispatchQueue.main.async {
                     if !text.isEmpty {
                         self.lastTranscription = text
+                        if isJarvis {
+                            self.askJarvis(text)
+                            return
+                        }
                         if self.inserter.insert(text: text) == .copiedToClipboard {
                             self.statusBar.state = .copiedToClipboard
                             self.statusBar.buildMenu()
@@ -420,6 +432,37 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                         if case .error = self.statusBar.state {
                             self.statusBar.state = .idle
                             self.statusBar.buildMenu()
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    private func askJarvis(_ text: String) {
+        print("Jarvis <- \(text)")
+        statusBar.state = .jarvisThinking
+        jarvis.ask(text) { [weak self] result in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                switch result {
+                case .success(let answer):
+                    let reply = answer.isEmpty ? "(réponse vide)" : answer
+                    print("Jarvis -> \(reply)")
+                    self.statusBar.state = .jarvisAnswer(reply)
+                    self.jarvisSpeaker.speak(reply)
+                    let duration = min(25, max(5, Double(reply.count) / 14))
+                    DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
+                        if case .jarvisAnswer = self.statusBar.state {
+                            self.statusBar.state = .idle
+                        }
+                    }
+                case .failure(let error):
+                    print("Jarvis error: \(error.localizedDescription)")
+                    self.statusBar.state = .error("Jarvis : \(error.localizedDescription)")
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
+                        if case .error = self.statusBar.state {
+                            self.statusBar.state = .idle
                         }
                     }
                 }

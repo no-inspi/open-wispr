@@ -16,6 +16,8 @@ class StatusBarController: NSObject {
     private var copiedFeedback = false
     private var menuItemTargets: [MenuItemTarget] = []
     private var stateMenuItem: NSMenuItem?
+    private let overlay = RecordingOverlay()
+    var jarvisMode = false
 
     var reprocessHandler: ((URL) -> Void)?
     var onConfigChange: ((Config) -> Void)?
@@ -27,11 +29,13 @@ class StatusBarController: NSObject {
         case downloading
         case waitingForPermission
         case copiedToClipboard
+        case jarvisThinking
+        case jarvisAnswer(String)
         case error(String)
     }
 
     var state: State = .idle {
-        didSet { updateIcon() }
+        didSet { updateIcon(); overlay.update(state, jarvis: jarvisMode) }
     }
 
     override init() {
@@ -107,6 +111,8 @@ class StatusBarController: NSObject {
             case .downloading: stateLabel = "Downloading model..."
             case .waitingForPermission: stateLabel = "Waiting for Accessibility permission..."
             case .copiedToClipboard: stateLabel = "Copied to clipboard"
+            case .jarvisThinking: stateLabel = "Jarvis réfléchit..."
+            case .jarvisAnswer: stateLabel = "Jarvis a répondu"
             case .error(let message): stateLabel = "Error: \(message)"
             }
         }
@@ -400,8 +406,10 @@ class StatusBarController: NSObject {
             setIcon(StatusBarController.drawLogo(active: false))
         case .recording:
             startRecordingAnimation()
-        case .transcribing:
+        case .transcribing, .jarvisThinking:
             startTranscribingAnimation()
+        case .jarvisAnswer:
+            setIcon(StatusBarController.drawLogo(active: false))
         case .downloading:
             startDownloadingAnimation()
         case .waitingForPermission:
