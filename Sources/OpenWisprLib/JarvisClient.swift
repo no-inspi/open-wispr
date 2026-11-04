@@ -96,7 +96,7 @@ final class JarvisClient {
                     if !Task.isCancelled { onTool(name) }
                 }
             }
-            await MainActor.run {
+            await MainActor.run { [weak self] in
                 guard !Task.isCancelled else { return }
                 self?.currentTask = nil
                 switch result {

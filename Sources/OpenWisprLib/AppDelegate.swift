@@ -495,7 +495,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         case .thinking(let detail):
             statusBar.state = .jarvisThinking(detail)
         case .answer(let reply):
-            statusBar.state = .jarvisAnswer(reply)
+            statusBar.state = .jarvisAnswer(JarvisSpeaker.plainText(reply))
             jarvisSpeaker.speak(reply)
             hideJarvis(after: min(25, max(5, Double(reply.count) / 14)))
         case .failure(let message):
