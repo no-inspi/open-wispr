@@ -68,8 +68,8 @@ final class RecordingOverlay {
                         color: jarvis ? .systemBlue : .systemRed, animate: true)
         case .transcribing:
             showCompact("Transcription…", color: jarvis ? .systemBlue : .systemOrange, animate: false)
-        case .jarvisThinking:
-            showCompact("Jarvis réfléchit…", color: .systemPurple, animate: true)
+        case .jarvisThinking(let detail):
+            showCompact(detail ?? "Jarvis réfléchit…", color: .systemPurple, animate: true)
         case .jarvisAnswer(let text):
             showAnswer(text, color: .systemPurple)
         case .copiedToClipboard:
@@ -98,6 +98,7 @@ final class RecordingOverlay {
 
         label.font = .systemFont(ofSize: 13, weight: .medium)
         label.maximumNumberOfLines = 1
+        label.lineBreakMode = .byTruncatingTail
         label.stringValue = text
         label.frame = NSRect(x: 76, y: 13, width: compactSize.width - 86, height: 18)
 
@@ -112,6 +113,7 @@ final class RecordingOverlay {
         let display = text.count > 600 ? String(text.prefix(600)) + "…" : text
         label.font = .systemFont(ofSize: 14, weight: .regular)
         label.maximumNumberOfLines = 10
+        label.lineBreakMode = .byWordWrapping
         label.stringValue = display
 
         let textWidth = answerWidth - 58

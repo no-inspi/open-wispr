@@ -18,6 +18,7 @@ class StatusBarController: NSObject {
     private var stateMenuItem: NSMenuItem?
     private let overlay = RecordingOverlay()
     var jarvisMode = false
+    var onIdle: (() -> Void)?
 
     var reprocessHandler: ((URL) -> Void)?
     var onConfigChange: ((Config) -> Void)?
@@ -29,13 +30,17 @@ class StatusBarController: NSObject {
         case downloading
         case waitingForPermission
         case copiedToClipboard
-        case jarvisThinking
+        case jarvisThinking(String?)
         case jarvisAnswer(String)
         case error(String)
     }
 
     var state: State = .idle {
-        didSet { updateIcon(); overlay.update(state, jarvis: jarvisMode) }
+        didSet {
+            updateIcon()
+            overlay.update(state, jarvis: jarvisMode)
+            if case .idle = state { onIdle?() }
+        }
     }
 
     override init() {

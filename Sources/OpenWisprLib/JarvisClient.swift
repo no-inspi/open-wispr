@@ -10,7 +10,7 @@ enum JarvisError: LocalizedError {
     }
 }
 
-/// Envoie une demande à Hermes Agent (API compatible OpenAI, endpoint /v1/responses).
+/// Envoie une demande à Hermes Agent (API compatible OpenAI, endpoint /v1/responses en streaming).
 /// Réglages : ~/.config/open-wispr/jarvis.json  ->  {"url": "http://<hôte-tailscale>:8642", "resetAfterMinutes": 10}
 /// Clé API : trousseau macOS, service "open-wispr-jarvis".
 final class JarvisClient {
@@ -23,6 +23,7 @@ final class JarvisClient {
     static let keychainService = "open-wispr-jarvis"
 
     private var previousResponseID: String?
+    private var currentTask: Task<Void, Never>?
     private var lastExchange = Date.distantPast
 
     private func loadSettings() -> Settings {
@@ -35,8 +36,18 @@ final class JarvisClient {
         return settings
     }
 
-    /// À appeler sur le thread principal.
-    func ask(_ text: String, completion: @escaping (Result<String, Error>) -> Void) {
+    /// Interrompt la demande en cours : la déconnexion arrête aussi l'agent sur le serveur.
+    /// À appeler sur le thread principal. `completion` n'est alors plus appelé.
+    func cancel() {
+        currentTask?.cancel()
+        currentTask = nil
+    }
+
+    /// À appeler sur le thread principal. Les deux closures sont appelées sur le thread principal.
+    func ask(_ text: String,
+             onTool: @escaping (String) -> Void,
+             completion: @escaping (Result<String, Error>) -> Void) {
+        cancel()
         let settings = loadSettings()
         guard let key = Self.apiKey() else {
             completion(.failure(JarvisError.message("Clé API introuvable dans le trousseau (service \(Self.keychainService)).")))
@@ -60,6 +71,7 @@ final class JarvisClient {
         var body: [String: Any] = [
             "model": "hermes-agent",
             "input": text,
+            "stream": true,
             "instructions": settings.instructions ?? """
                 Tu es Jarvis, l'assistant vocal de Charlie. Ta réponse sera lue à voix haute : \
                 réponds en français, en 2 à 4 phrases, sans markdown, sans listes ni code. \
@@ -70,52 +82,63 @@ final class JarvisClient {
             body["previous_response_id"] = previous
         }
 
-        var request = URLRequest(url: url, timeoutInterval: 600)
+        // Le serveur envoie un keepalive toutes les 10 s : 60 s de silence = connexion perdue,
+        // même si la tâche elle-même dure bien plus longtemps.
+        var request = URLRequest(url: url, timeoutInterval: 60)
         request.httpMethod = "POST"
         request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONSerialization.data(withJSONObject: body)
 
-        URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
-            if let error = error {
-                completion(.failure(error))
-                return
+        currentTask = Task { [weak self] in
+            let result = await Self.stream(request) { name in
+                await MainActor.run {
+                    if !Task.isCancelled { onTool(name) }
+                }
             }
-            guard let http = response as? HTTPURLResponse, let data = data else {
-                completion(.failure(JarvisError.message("Réponse vide de Jarvis.")))
-                return
+            await MainActor.run {
+                guard !Task.isCancelled else { return }
+                self?.currentTask = nil
+                switch result {
+                case .success(let answer):
+                    self?.previousResponseID = answer.id
+                    self?.lastExchange = Date()
+                    completion(.success(answer.text))
+                case .failure(let error):
+                    completion(.failure(error))
+                }
             }
-            guard (200..<300).contains(http.statusCode) else {
-                let detail = String(data: data, encoding: .utf8)?.prefix(200) ?? ""
-                completion(.failure(JarvisError.message("HTTP \(http.statusCode) \(detail)")))
-                return
-            }
-            guard let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] else {
-                completion(.failure(JarvisError.message("Réponse illisible de Jarvis.")))
-                return
-            }
-            let answer = Self.extractText(json)
-            let responseID = json["id"] as? String
-            DispatchQueue.main.async {
-                self?.previousResponseID = responseID
-                self?.lastExchange = Date()
-            }
-            completion(.success(answer))
-        }.resume()
+        }
     }
 
-    private static func extractText(_ json: [String: Any]) -> String {
-        if let text = json["output_text"] as? String, !text.isEmpty {
-            return text.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
-        var parts: [String] = []
-        for item in json["output"] as? [[String: Any]] ?? [] {
-            guard (item["type"] as? String) == "message" else { continue }
-            for content in item["content"] as? [[String: Any]] ?? [] {
-                if let text = content["text"] as? String { parts.append(text) }
+    private static func stream(_ request: URLRequest,
+                               onTool: (String) async -> Void) async -> Result<(id: String?, text: String), Error> {
+        do {
+            let (bytes, response) = try await URLSession.shared.bytes(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                return .failure(JarvisError.message("Réponse vide de Jarvis."))
             }
+            guard (200..<300).contains(http.statusCode) else {
+                var detail = Data()
+                for try await byte in bytes.prefix(200) { detail.append(byte) }
+                return .failure(JarvisError.message("HTTP \(http.statusCode) \(String(decoding: detail, as: UTF8.self))"))
+            }
+            for try await line in bytes.lines {
+                switch JarvisStream.parse(line) {
+                case .tool(let name):
+                    await onTool(name)
+                case .completed(let id, let text):
+                    return .success((id, text))
+                case .failed(let message):
+                    return .failure(JarvisError.message(message))
+                case nil:
+                    continue
+                }
+            }
+            return .failure(JarvisError.message("Connexion à Jarvis interrompue."))
+        } catch {
+            return .failure(error)
         }
-        return parts.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     static func apiKey() -> String? {

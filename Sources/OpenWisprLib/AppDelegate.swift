@@ -12,6 +12,8 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private let jarvis = JarvisClient()
     private let jarvisSpeaker = JarvisSpeaker()
     private var jarvisMode = false
+    private var jarvisPresenter = JarvisPresenter()
+    private var jarvisHideWork: DispatchWorkItem?
     var currentRecordingURL: URL?
     private var sleepWakeObservers: [NSObjectProtocol] = []
     private var accessibilityPollTimer: Timer?
@@ -20,6 +22,12 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     public func applicationDidFinishLaunching(_ notification: Notification) {
         statusBar = StatusBarController()
+        statusBar.onIdle = { [weak self] in
+            DispatchQueue.main.async {
+                guard let self = self, self.isScreenFreeForJarvis else { return }
+                self.render(self.jarvisPresenter.screenFreed())
+            }
+        }
         recorder = AudioRecorder()
         registerSleepWakeObservers()
 
@@ -345,6 +353,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         jarvisMode = NSEvent.modifierFlags.contains(.option)
         statusBar.jarvisMode = jarvisMode
         jarvisSpeaker.stop()
+        if jarvisMode {
+            // Une nouvelle question remplace la précédente ; une simple dictée la laisse tourner.
+            jarvis.cancel()
+            jarvisPresenter.reset()
+        }
         statusBar.state = .recording
         do {
             recorder.preferredDeviceID = AudioDeviceManager.resolveConfiguredDeviceID(
@@ -441,33 +454,66 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func askJarvis(_ text: String) {
         print("Jarvis <- \(text)")
-        statusBar.state = .jarvisThinking
-        jarvis.ask(text) { [weak self] result in
+        // Cette transcription est la nôtre : elle ne compte pas comme une dictée en cours.
+        var screenFree = isScreenFreeForJarvis
+        if case .transcribing = statusBar.state { screenFree = true }
+        render(jarvisPresenter.update(.thinking(nil), screenFree: screenFree))
+        jarvis.ask(text, onTool: { [weak self] name in
+            print("Jarvis outil : \(name)")
+            self?.showJarvis(.thinking(JarvisStream.toolLabel(name)))
+        }, completion: { [weak self] result in
             DispatchQueue.main.async {
-                guard let self = self else { return }
                 switch result {
                 case .success(let answer):
                     let reply = answer.isEmpty ? "(réponse vide)" : answer
                     print("Jarvis -> \(reply)")
-                    self.statusBar.state = .jarvisAnswer(reply)
-                    self.jarvisSpeaker.speak(reply)
-                    let duration = min(25, max(5, Double(reply.count) / 14))
-                    DispatchQueue.main.asyncAfter(deadline: .now() + duration) {
-                        if case .jarvisAnswer = self.statusBar.state {
-                            self.statusBar.state = .idle
-                        }
-                    }
+                    self?.showJarvis(.answer(reply))
                 case .failure(let error):
                     print("Jarvis error: \(error.localizedDescription)")
-                    self.statusBar.state = .error("Jarvis : \(error.localizedDescription)")
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-                        if case .error = self.statusBar.state {
-                            self.statusBar.state = .idle
-                        }
-                    }
+                    self?.showJarvis(.failure("Jarvis : \(error.localizedDescription)"))
                 }
             }
+        })
+    }
+
+    /// Une dictée en cours garde la pastille : Jarvis attend qu'elle se termine.
+    private func showJarvis(_ display: JarvisPresenter.Display) {
+        render(jarvisPresenter.update(display, screenFree: isScreenFreeForJarvis))
+    }
+
+    private var isScreenFreeForJarvis: Bool {
+        switch statusBar.state {
+        case .idle, .jarvisThinking, .jarvisAnswer: return true
+        default: return false
         }
+    }
+
+    private func render(_ display: JarvisPresenter.Display?) {
+        guard let display = display else { return }
+        jarvisHideWork?.cancel()
+        switch display {
+        case .thinking(let detail):
+            statusBar.state = .jarvisThinking(detail)
+        case .answer(let reply):
+            statusBar.state = .jarvisAnswer(reply)
+            jarvisSpeaker.speak(reply)
+            hideJarvis(after: min(25, max(5, Double(reply.count) / 14)))
+        case .failure(let message):
+            statusBar.state = .error(message)
+            hideJarvis(after: 5)
+        }
+    }
+
+    private func hideJarvis(after delay: TimeInterval) {
+        let work = DispatchWorkItem { [weak self] in
+            guard let self = self else { return }
+            switch self.statusBar.state {
+            case .jarvisAnswer, .error: self.statusBar.state = .idle
+            default: break
+            }
+        }
+        jarvisHideWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
     }
 
     private func postProcess(_ raw: String) -> String {
