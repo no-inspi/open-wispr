@@ -479,10 +479,11 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
         var screenFree = isScreenFreeForJarvis
         if case .transcribing = statusBar.state { screenFree = true }
         render(jarvisPresenter.update(.thinking(nil), screenFree: screenFree))
-        jarvis.ask(text, onTool: { [weak self] name in
+        let onTool: (String) -> Void = { [weak self] name in
             print("Jarvis outil : \(name)")
             self?.showJarvis(.thinking(JarvisStream.toolLabel(name)))
-        }, completion: { [weak self] result in
+        }
+        let completion: (Result<String, Error>) -> Void = { [weak self] result in
             DispatchQueue.main.async {
                 switch result {
                 case .success(let answer):
@@ -494,7 +495,18 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
                     self?.showJarvis(.failure("Jarvis : \(error.localizedDescription)"))
                 }
             }
-        })
+        }
+        switch JarvisCommand.parse(text) {
+        case .ask(let question):
+            jarvis.ask(question, onTool: onTool, completion: completion)
+        case .remember(let note):
+            jarvis.remember(note, onTool: onTool, completion: completion)
+        case .newConversation:
+            let reply = jarvis.newConversation()
+                ? "Nouvelle conversation. La tâche de fond en cours ne sera pas annoncée."
+                : "Nouvelle conversation."
+            completion(.success(reply))
+        }
     }
 
     /// Une dictée en cours garde la pastille : Jarvis attend qu'elle se termine.

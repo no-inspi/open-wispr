@@ -194,6 +194,35 @@ final class JarvisClient {
         startTurn(text, keepSession: false, onTool: onTool, completion: completion)
     }
 
+    /// Retient une note dans une conversation à part : celle en cours n'est pas touchée.
+    /// Les deux closures sont appelées sur le thread principal.
+    func remember(_ note: String,
+                  onTool: @escaping (String) -> Void,
+                  completion: @escaping (Result<String, Error>) -> Void) {
+        cancel()
+        let api: JarvisAPI
+        do {
+            api = try makeAPI(loadSettings())
+        } catch {
+            completion(.failure(error))
+            return
+        }
+        let sessionID = "jarvis-note-\(UUID().uuidString.lowercased())"
+        let body: [String: Any] = ["input": note, "session_id": sessionID, "instructions": JarvisNote.instructions]
+        run(api, body, sessionID, onTool: onTool) { [weak self] result, messages in
+            self?.endNote(result, messages, completion)
+        }
+    }
+
+    /// Repart sur une conversation neuve. Retourne vrai si une tâche de fond ne sera plus annoncée.
+    func newConversation() -> Bool {
+        cancel()
+        let hadPending = tracker.hasPending
+        tracker = JarvisBackgroundTracker()
+        saveTracker()
+        return hadPending
+    }
+
     private func startTurn(_ text: String, keepSession: Bool,
                            onTool: @escaping (String) -> Void,
                            completion: @escaping (Result<String, Error>) -> Void) {
@@ -227,13 +256,21 @@ final class JarvisClient {
                 """,
         ]
 
+        run(api, body, sessionID, onTool: onTool) { [weak self] result, messages in
+            self?.endTurn(result, messages, completion)
+        }
+    }
+
+    private func run(_ api: JarvisAPI, _ body: [String: Any], _ sessionID: String,
+                     onTool: @escaping (String) -> Void,
+                     finish: @escaping (JarvisRunEvent, [JarvisSessionMessage]) -> Void) {
         currentTask = Task { [weak self] in
             let runID: String
             do {
                 runID = try await api.createRun(body)
             } catch {
-                await MainActor.run { [weak self] in
-                    if !Task.isCancelled { self?.endTurn(.failed(error.localizedDescription), [], completion) }
+                await MainActor.run {
+                    if !Task.isCancelled { finish(.failed(error.localizedDescription), []) }
                 }
                 return
             }
@@ -253,10 +290,26 @@ final class JarvisClient {
                 }
             }
             let messages = (try? await api.messages(sessionID)) ?? []
-            await MainActor.run { [weak self] in
-                if !Task.isCancelled { self?.endTurn(result, messages, completion) }
+            await MainActor.run {
+                if !Task.isCancelled { finish(result, messages) }
             }
         }
+    }
+
+    private func endNote(_ result: JarvisRunEvent, _ messages: [JarvisSessionMessage],
+                         _ completion: (Result<String, Error>) -> Void) {
+        currentTask = nil
+        currentRun = nil
+        isAnnouncing = false
+        switch result {
+        case .completed(let answer) where JarvisNote.saved(messages):
+            completion(.success(answer))
+        case .failed(let message):
+            completion(.failure(JarvisError.message(message)))
+        default:
+            completion(.failure(JarvisError.message("Je n'ai rien retenu.")))
+        }
+        startWatching()
     }
 
     private func endTurn(_ result: JarvisRunEvent, _ messages: [JarvisSessionMessage],

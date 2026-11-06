@@ -12,6 +12,7 @@ struct JarvisSessionMessage: Equatable {
     let role: String
     let kind: String?
     let content: String
+    var toolName: String? = nil
 }
 
 /// Lit les réponses de l'API Runs d'Hermes. Le flux SSE se lit ligne à ligne : chaque ligne
@@ -60,7 +61,8 @@ enum JarvisStream {
             return JarvisSessionMessage(id: id,
                                         role: row["role"] as? String ?? "",
                                         kind: row["display_kind"] as? String,
-                                        content: row["content"] as? String ?? "")
+                                        content: row["content"] as? String ?? "",
+                                        toolName: row["tool_name"] as? String)
         }
     }
 
