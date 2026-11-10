@@ -28,17 +28,22 @@ WORDS_FILE = Path(os.environ.get("JARVIS_VOICE_WORDS", Path.home() / ".config/op
 MAX_TEXT = 5000
 
 
-def read_words(path: Path) -> list[str]:
-    """Un mot ou une expression par ligne ; # commence un commentaire."""
-    words = []
+def read_words(path: Path) -> dict[str, str | None]:
+    """Un mot ou une expression par ligne ; # commence un commentaire.
+
+    « mot = phonèmes » impose une prononciation (alphabet de Kokoro) ;
+    sinon le mot est prononcé à l'anglaise.
+    """
+    words = {}
     for line in path.read_text(encoding="utf-8").splitlines():
-        word = line.split("#", 1)[0].strip()
-        if word:
-            words.append(word)
+        entry = line.split("#", 1)[0]
+        word, _, phonemes = entry.partition("=")
+        if word.strip():
+            words[word.strip().lower()] = phonemes.strip() or None
     return words
 
 
-def english_pattern(words: list[str]) -> re.Pattern | None:
+def english_pattern(words) -> re.Pattern | None:
     if not words:
         return None
     # Les expressions longues d'abord, pour que « pull request » passe avant « pull ».
@@ -61,8 +66,9 @@ def split_by_language(text: str, pattern: re.Pattern | None) -> list[tuple[str, 
     return parts
 
 
-def phonemize(text: str, pattern: re.Pattern | None, phonemize_part) -> str:
+def phonemize(text: str, pattern: re.Pattern | None, phonemize_part, overrides=None) -> str:
     """Phonémise chaque morceau dans sa langue en gardant les espaces qui l'entourent."""
+    overrides = overrides or {}
     out = []
     for lang, part in split_by_language(text, pattern):
         core = part.strip()
@@ -71,7 +77,8 @@ def phonemize(text: str, pattern: re.Pattern | None, phonemize_part) -> str:
             continue
         lead = " " if part[0].isspace() else ""
         trail = " " if part[-1].isspace() else ""
-        out.append(lead + phonemize_part(core, lang) + trail)
+        forced = overrides.get(core.lower()) if lang == "en-us" else None
+        out.append(lead + (forced or phonemize_part(core, lang)) + trail)
     return re.sub(r" {2,}", " ", "".join(out)).strip()
 
 
@@ -93,21 +100,23 @@ class Voice:
         self.lock = threading.Lock()
         self.words_mtime = None
         self.pattern = None
+        self.words = {}
 
     def refresh_words(self):
         try:
             mtime = WORDS_FILE.stat().st_mtime
         except FileNotFoundError:
-            self.words_mtime, self.pattern = None, None
+            self.words_mtime, self.pattern, self.words = None, None, {}
             return
         if mtime != self.words_mtime:
-            self.pattern = english_pattern(read_words(WORDS_FILE))
+            self.words = read_words(WORDS_FILE)
+            self.pattern = english_pattern(self.words)
             self.words_mtime = mtime
 
     def wav(self, text: str) -> bytes:
         with self.lock:
             self.refresh_words()
-            phonemes = phonemize(text, self.pattern, self.tokenizer.phonemize)
+            phonemes = phonemize(text, self.pattern, self.tokenizer.phonemize, self.words)
             samples, sample_rate = self.kokoro.create(phonemes, voice=VOICE, speed=SPEED, is_phonemes=True)
         return to_wav(samples, sample_rate)
 

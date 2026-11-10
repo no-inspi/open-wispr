@@ -61,6 +61,11 @@ cat > "$PLIST" <<PLIST
 PLIST
 
 launchctl bootout "$SERVICE" 2>/dev/null || true
+# bootout rend la main avant l'arrêt complet : bootstrap échouerait.
+for _ in {1..20}; do
+    launchctl print "$SERVICE" >/dev/null 2>&1 || break
+    sleep 0.5
+done
 launchctl bootstrap gui/$(id -u) "$PLIST"
 
 for _ in {1..60}; do

@@ -1,8 +1,10 @@
 # Mots prononcés à l'anglaise par la voix de Jarvis, un par ligne.
 # La casse est ignorée. Le fichier est relu dès qu'il change.
+# « mot = phonèmes » impose une prononciation (alphabet IPA de Kokoro).
 # Copie locale : ~/.config/open-wispr/jarvis-english-words.txt
 
 # Outils et services
+Tendr = tˈɛndœʁ
 Git
 GitHub
 GitLab
