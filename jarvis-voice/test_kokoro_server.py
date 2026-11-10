@@ -65,5 +65,44 @@ class WordsFileTests(unittest.TestCase):
         self.assertEqual(words["tendr"], "tɛndøʁ")
 
 
+class LearningTests(unittest.TestCase):
+    def test_most_frequent_transcription_wins(self):
+        self.assertEqual(ks.choose_phonemes(["tɛndør", "tɛndøʁ", "tɛndør"]), "tɛndør")
+
+    def test_tie_goes_to_the_closest_to_the_others(self):
+        self.assertEqual(ks.choose_phonemes(["tɛndøʁ", "tɛndyʁ", "a"]), "tɛndøʁ")
+
+    def test_same_length_takes_vote_sound_by_sound(self):
+        self.assertEqual(ks.choose_phonemes(["tʌndər", "tɛndəʁ", "tɛndør"]), "tɛndər")
+
+    def test_empty_takes_give_nothing(self):
+        self.assertIsNone(ks.choose_phonemes(["", ""]))
+
+    def test_edit_distance(self):
+        self.assertEqual(ks.edit_distance("tɛndøʁ", "tɛndyʁ"), 1)
+        self.assertEqual(ks.edit_distance("", "abc"), 3)
+
+    def test_set_word_replaces_the_line_ignoring_case(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "words.txt"
+            path.write_text("# titre\nGit\ntendr = tˈɛndœʁ  # ancien\n", encoding="utf-8")
+            ks.set_word(path, "Tendr", "tɛndøʁ")
+            self.assertEqual(path.read_text(encoding="utf-8"), "# titre\nGit\nTendr = tɛndøʁ\n")
+
+    def test_set_word_appends_a_new_word(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "words.txt"
+            path.write_text("Git\n", encoding="utf-8")
+            ks.set_word(path, "Cyrus", "sˈaɪɹəs")
+            self.assertEqual(ks.read_words(path), {"git": None, "cyrus": "sˈaɪɹəs"})
+
+    def test_trim_silence_keeps_the_word(self):
+        import numpy as np
+        audio = np.zeros(16000, dtype="float32")
+        audio[8000:9600] = 0.5
+        trimmed = ks.trim_silence(audio, 16000)
+        self.assertEqual(len(trimmed), 1600 + 2 * 1600)
+
+
 if __name__ == "__main__":
     unittest.main()

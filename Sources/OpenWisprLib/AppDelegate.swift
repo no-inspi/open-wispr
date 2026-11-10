@@ -14,6 +14,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
     private var jarvisMode = false
     private var jarvisPresenter = JarvisPresenter()
     private var jarvisHideWork: DispatchWorkItem?
+    private var learning = PronunciationLearning()
     var currentRecordingURL: URL?
     private var sleepWakeObservers: [NSObjectProtocol] = []
     private var accessibilityPollTimer: Timer?
@@ -393,6 +394,31 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
         currentRecordingURL = nil
         let isJarvis = jarvisMode
+        _ = learning.expireIfIdle()
+        if isJarvis, learning.isRecordingTakes {
+            if config.isSoundFeedbackEnabled {
+                recordingSoundFeedback.playStopped()
+            }
+            statusBar.state = .transcribing
+            // La prise est aussi transcrite : « annule » arrête l'apprentissage.
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                let heard = (try? self.transcriber.transcribe(audioURL: audioURL)).map(self.postProcess) ?? ""
+                DispatchQueue.main.async {
+                    if PronunciationAnswer.parse(heard) == .cancel {
+                        self.learning.cancel()
+                        if Config.effectiveMaxRecordings(self.config.maxRecordings) == 0 {
+                            try? FileManager.default.removeItem(at: audioURL)
+                        }
+                        self.statusBar.state = .idle
+                        self.showJarvis(.answer("D'accord, je laisse tomber."))
+                    } else {
+                        self.collectPronunciationTake(audioURL)
+                    }
+                }
+            }
+            return
+        }
         statusBar.state = .transcribing
         if config.isSoundFeedbackEnabled {
             recordingSoundFeedback.playStopped()
@@ -475,6 +501,10 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func askJarvis(_ text: String) {
         print("Jarvis <- \(text)")
+        if learning.expireIfIdle() {
+            print("Apprentissage de prononciation expiré")
+        }
+        if learning.isConfirming, answerPronunciation(text) { return }
         // Cette transcription est la nôtre : elle ne compte pas comme une dictée en cours.
         var screenFree = isScreenFreeForJarvis
         if case .transcribing = statusBar.state { screenFree = true }
@@ -501,12 +531,82 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             jarvis.ask(question, onTool: onTool, completion: completion)
         case .remember(let note):
             jarvis.remember(note, onTool: onTool, completion: completion)
+        case .learnPronunciation(let word):
+            learning.start(word)
+            JarvisVoiceService.prepare()
+            completion(.success("D'accord, j'apprends « \(word) ». Maintiens Option et dis le mot, "
+                + "trois fois de suite."))
         case .newConversation:
             let reply = jarvis.newConversation()
                 ? "Nouvelle conversation. La tâche de fond en cours ne sera pas annoncée."
                 : "Nouvelle conversation."
             completion(.success(reply))
         }
+    }
+
+    /// Une prise ⌥ pendant l'apprentissage n'est pas transcrite : elle part au service vocal.
+    private func collectPronunciationTake(_ audioURL: URL) {
+        let directory = JarvisVoiceService.takesDirectory
+        let take = directory.appendingPathComponent("take-\(learning.takeCount + 1).wav")
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            try? FileManager.default.removeItem(at: take)
+            try FileManager.default.copyItem(at: audioURL, to: take)
+        } catch {
+            learning.cancel()
+            showJarvis(.failure("Apprentissage : prise impossible à enregistrer."))
+            return
+        }
+        if Config.effectiveMaxRecordings(config.maxRecordings) == 0 {
+            try? FileManager.default.removeItem(at: audioURL)
+        }
+        guard let takes = learning.addTake(take) else {
+            statusBar.state = .idle
+            showJarvis(.answer("Prise \(learning.takeCount) sur \(PronunciationLearning.takesNeeded)."))
+            return
+        }
+        statusBar.state = .idle
+        showJarvis(.thinking("J'écoute les prises…"))
+        Task { @MainActor [weak self] in
+            do {
+                let phonemes = try await JarvisVoiceService.learn(takes)
+                guard let self = self, let word = self.learning.word else { return }
+                print("Prononciation apprise : \(word) = \(phonemes)")
+                self.learning.learned(phonemes)
+                self.showJarvis(.answer("Voici le mot \(word), dans une phrase. Je le garde ?"))
+            } catch {
+                self?.learning.cancel()
+                self?.showJarvis(.failure("Apprentissage : \(error.localizedDescription)"))
+            }
+        }
+    }
+
+    /// Renvoie vrai si la phrase était la réponse à « Je le garde ? ».
+    private func answerPronunciation(_ text: String) -> Bool {
+        guard case .confirming(let word, let phonemes) = learning.phase else { return false }
+        switch PronunciationAnswer.parse(text) {
+        case .keep:
+            learning.cancel()
+            showJarvis(.thinking(nil))
+            Task { @MainActor [weak self] in
+                do {
+                    try await JarvisVoiceService.saveWord(word, phonemes: phonemes)
+                    self?.showJarvis(.answer("C'est noté, je dirai \(word) comme ça."))
+                } catch {
+                    self?.showJarvis(.failure("Apprentissage : \(error.localizedDescription)"))
+                }
+            }
+        case .retry:
+            learning.start(word)
+            showJarvis(.answer("D'accord, on recommence. Dis le mot trois fois, avec Option."))
+        case .cancel:
+            learning.cancel()
+            showJarvis(.answer("D'accord, je laisse tomber."))
+        case .other:
+            learning.cancel()
+            return false
+        }
+        return true
     }
 
     /// Une dictée en cours garde la pastille : Jarvis attend qu'elle se termine.
@@ -529,7 +629,7 @@ public class AppDelegate: NSObject, NSApplicationDelegate {
             statusBar.state = .jarvisThinking(detail)
         case .answer(let reply):
             statusBar.state = .jarvisAnswer(JarvisSpeaker.plainText(reply))
-            jarvisSpeaker.speak(reply)
+            jarvisSpeaker.speak(reply, pronunciations: learning.pendingPronunciation)
             hideJarvis(after: min(25, max(5, Double(reply.count) / 14)))
         case .failure(let message):
             statusBar.state = .error(message)

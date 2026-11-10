@@ -409,12 +409,13 @@ final class JarvisSpeaker {
     /// Change à chaque nouvelle lecture : une réponse arrivée trop tard est ignorée.
     private var generation = 0
 
-    func speak(_ text: String) {
+    /// `pronunciations` impose une prononciation pour cette lecture seulement.
+    func speak(_ text: String, pronunciations: [String: String] = [:]) {
         stop()
         let plain = Self.plainText(text)
         let current = generation
         request = Task { @MainActor [weak self] in
-            let audio = try? await Self.synthesize(plain)
+            let audio = try? await Self.synthesize(plain, pronunciations: pronunciations)
             guard let self = self, self.generation == current else { return }
             self.request = nil
             if let audio = audio, let player = try? AVAudioPlayer(data: audio), player.play() {
@@ -441,12 +442,12 @@ final class JarvisSpeaker {
         }
     }
 
-    private static func synthesize(_ text: String) async throws -> Data {
+    private static func synthesize(_ text: String, pronunciations: [String: String]) async throws -> Data {
         // Kokoro produit l'audio environ cinq fois plus vite que sa durée.
         var request = URLRequest(url: serviceURL, timeoutInterval: max(10, Double(text.count) / 30))
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["text": text])
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["text": text, "pronunciations": pronunciations])
         let (data, response) = try await URLSession.shared.data(for: request)
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {
             throw JarvisError.message("voix Kokoro : HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")

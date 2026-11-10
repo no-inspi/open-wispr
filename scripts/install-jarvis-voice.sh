@@ -1,5 +1,6 @@
 #!/bin/zsh
-# Installe la voix de Jarvis (Kokoro, voix française ff_siwis) comme service local.
+# Installe la voix de Jarvis (Kokoro, voix française ff_siwis) comme service local,
+# avec l'apprentissage de prononciation par la voix.
 # Relançable : ne retélécharge que ce qui manque et ne touche pas à la liste de mots
 # déjà personnalisée.
 set -euo pipefail
@@ -19,7 +20,14 @@ command -v uv >/dev/null || { echo "uv est requis : brew install uv" >&2; exit 1
 mkdir -p "$MODELS" "${WORDS:h}"
 
 uv venv -q --allow-existing --python 3.12 "$HOME_DIR/venv"
-uv pip install -q --python "$HOME_DIR/venv/bin/python" "kokoro-onnx==0.6.1"
+# torch, transformers et soundfile servent à apprendre une prononciation par la voix.
+uv pip install -q --python "$HOME_DIR/venv/bin/python" "kokoro-onnx==0.6.1" \
+    "torch==2.15.0" "transformers==5.22.2" "soundfile==0.14.0"
+echo "Modèle de phonèmes (environ 1,2 Go au premier lancement)…"
+"$HOME_DIR/venv/bin/python" -c "
+from huggingface_hub import snapshot_download
+snapshot_download('facebook/wav2vec2-xlsr-53-espeak-cv-ft', revision='3e836924cfd3b858a0bbdbc1f7ef412105d00446',
+                  allow_patterns=['*.json', '*.txt', 'model.safetensors'])" >/dev/null
 
 typeset -A SHA=(
     kokoro-v1.0.onnx 7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5

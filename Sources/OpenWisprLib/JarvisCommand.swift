@@ -6,6 +6,7 @@ enum JarvisCommand: Equatable {
     case ask(String)
     case newConversation
     case remember(String)
+    case learnPronunciation(String)
 
     private static let newConversationPhrases: Set<String> = [
         "nouvelle conversation", "une nouvelle conversation", "ouvre une nouvelle conversation",
@@ -24,6 +25,9 @@ enum JarvisCommand: Equatable {
            let note = Range(match.range(at: 1), in: text),
            text[note].rangeOfCharacter(from: .alphanumerics) != nil {
             return .remember(String(text[note]))
+        }
+        if let word = PronunciationCommand.word(in: text) {
+            return .learnPronunciation(word)
         }
         return .ask(text)
     }
