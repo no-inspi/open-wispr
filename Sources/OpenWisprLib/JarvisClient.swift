@@ -397,24 +397,68 @@ final class JarvisClient {
     }
 }
 
-/// Lit les réponses de Jarvis avec la synthèse vocale de macOS (voix française).
+/// Lit les réponses de Jarvis avec Kokoro, servi en local par `jarvis-voice/kokoro_server.py`.
+/// Si le service ne répond pas, la synthèse vocale de macOS prend le relais.
+/// Tous les appels se font sur le thread principal.
 final class JarvisSpeaker {
+    static let serviceURL = URL(string: "http://127.0.0.1:47860/speak")!
+
     private let synthesizer = AVSpeechSynthesizer()
+    private var player: AVAudioPlayer?
+    private var request: Task<Void, Never>?
+    /// Change à chaque nouvelle lecture : une réponse arrivée trop tard est ignorée.
+    private var generation = 0
 
     func speak(_ text: String) {
         stop()
-        let utterance = AVSpeechUtterance(string: Self.plainText(text))
-        utterance.voice = AVSpeechSynthesisVoice(language: "fr-FR")
-        utterance.rate = 0.52
-        synthesizer.speak(utterance)
+        let plain = Self.plainText(text)
+        let current = generation
+        request = Task { @MainActor [weak self] in
+            let audio = try? await Self.synthesize(plain)
+            guard let self = self, self.generation == current else { return }
+            self.request = nil
+            if let audio = audio, let player = try? AVAudioPlayer(data: audio), player.play() {
+                self.player = player
+            } else {
+                print("Voix Kokoro indisponible : voix macOS")
+                self.speakWithSystemVoice(plain)
+            }
+        }
     }
 
-    var isSpeaking: Bool { synthesizer.isSpeaking }
+    var isSpeaking: Bool {
+        request != nil || player?.isPlaying == true || synthesizer.isSpeaking
+    }
 
     func stop() {
+        generation += 1
+        request?.cancel()
+        request = nil
+        player?.stop()
+        player = nil
         if synthesizer.isSpeaking {
             synthesizer.stopSpeaking(at: .immediate)
         }
+    }
+
+    private static func synthesize(_ text: String) async throws -> Data {
+        // Kokoro produit l'audio environ cinq fois plus vite que sa durée.
+        var request = URLRequest(url: serviceURL, timeoutInterval: max(10, Double(text.count) / 30))
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["text": text])
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard (response as? HTTPURLResponse)?.statusCode == 200 else {
+            throw JarvisError.message("voix Kokoro : HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0)")
+        }
+        return data
+    }
+
+    private func speakWithSystemVoice(_ text: String) {
+        let utterance = AVSpeechUtterance(string: text)
+        utterance.voice = AVSpeechSynthesisVoice(language: "fr-FR")
+        utterance.rate = 0.52
+        synthesizer.speak(utterance)
     }
 
     /// Retire le markdown que le modèle pourrait quand même produire.

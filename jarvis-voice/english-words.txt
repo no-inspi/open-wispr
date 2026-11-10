@@ -1,0 +1,59 @@
+# Mots prononcés à l'anglaise par la voix de Jarvis, un par ligne.
+# La casse est ignorée. Le fichier est relu dès qu'il change.
+# Copie locale : ~/.config/open-wispr/jarvis-english-words.txt
+
+# Outils et services
+Git
+GitHub
+GitLab
+Vault
+Docker
+Kubernetes
+Helm
+Argo
+Terraform
+Tailscale
+Linear
+Cyrus
+Jarvis
+Slack
+Jira
+Confluence
+Gmail
+Google Drive
+Google Calendar
+Karpenter
+Scaleway
+Hostinger
+Python
+Swift
+TypeScript
+
+# Vocabulaire de dev
+issue
+issues
+commit
+commits
+push
+pull request
+pull requests
+merge
+deploy
+release
+build
+bug
+bugs
+feature
+features
+branch
+cluster
+clusters
+pipeline
+pipelines
+workflow
+workflows
+backend
+frontend
+dashboard
+review
+sprint
