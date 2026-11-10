@@ -46,23 +46,23 @@ class PhonemizeTests(unittest.TestCase):
 
 
     def test_forced_pronunciation_replaces_english(self):
-        words = {"tendr": "tˈɛndœʁ", "git": None}
+        words = {"tendr": "tɛndøʁ", "git": None}
         pattern = ks.english_pattern(words)
         self.assertEqual(ks.phonemize("sur TENDR et Git", pattern, fake, words),
-                         "<fr:sur> tˈɛndœʁ <fr:et> <en:Git>")
+                         "<fr:sur> tɛndøʁ <fr:et> <en:Git>")
 
 
 class WordsFileTests(unittest.TestCase):
     def test_ignores_comments_and_blank_lines(self):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "words.txt"
-            path.write_text("# titre\nGit\n\n  Vault  # coffre\nTendr = tˈɛndœʁ\n", encoding="utf-8")
-            self.assertEqual(ks.read_words(path), {"git": None, "vault": None, "tendr": "tˈɛndœʁ"})
+            path.write_text("# titre\nGit\n\n  Vault  # coffre\nTendr = tɛndøʁ\n", encoding="utf-8")
+            self.assertEqual(ks.read_words(path), {"git": None, "vault": None, "tendr": "tɛndøʁ"})
 
     def test_default_list_is_readable(self):
         words = ks.read_words(Path(__file__).with_name("english-words.txt"))
         self.assertIn("git", words)
-        self.assertEqual(words["tendr"], "tˈɛndœʁ")
+        self.assertEqual(words["tendr"], "tɛndøʁ")
 
 
 if __name__ == "__main__":

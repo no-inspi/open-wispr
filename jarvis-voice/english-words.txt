@@ -4,7 +4,7 @@
 # Copie locale : ~/.config/open-wispr/jarvis-english-words.txt
 
 # Outils et services
-Tendr = tˈɛndœʁ
+Tendr = tɛndøʁ
 Git
 GitHub
 GitLab
